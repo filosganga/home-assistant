@@ -1,0 +1,33 @@
+# --- secrets ---
+mosquitto/config/passwd
+ha/config/secrets.yaml
+ha/config/.storage/
+.env
+
+# --- Home Assistant runtime state ---
+ha/config/*.db
+ha/config/*.db-shm
+ha/config/*.db-wal
+ha/config/*.log
+ha/config/*.log.*
+ha/config/*.pid
+ha/config/.cloud/
+ha/config/.HA_VERSION
+ha/config/backups/
+ha/config/blueprints/
+ha/config/custom_components/
+ha/config/deps/
+ha/config/image/
+ha/config/tts/
+ha/config/www/community/
+ha/config/__pycache__/
+ha/config/.ip_authenticated
+
+# --- Mosquitto runtime ---
+mosquitto/data/
+mosquitto/log/
+
+# --- editor / OS ---
+*.swp
+.DS_Store
+
