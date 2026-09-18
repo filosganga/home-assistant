@@ -1,0 +1,199 @@
+# Home Assistant's half of the cat-feeder contract.
+#
+# The feeders have no RTC, no NTP and no flash. Everything they know arrives
+# from the broker as a retained message, and this file is what publishes it.
+# If Home Assistant stops, the feeders keep free-running on the last time and
+# schedule they heard; if a feeder reboots while Home Assistant is down, it
+# waits rather than guessing.
+#
+# Install: see "Home Assistant automations" in dev/README.md. The same file goes
+# to the local Docker stack and to any deployed instance, unchanged — nothing in
+# it names a host, which is why it is tracked in the firmware repo at all.
+#
+# ---------------------------------------------------------------------------
+# NO DEVICE ID APPEARS IN THIS FILE, and adding a feeder needs no edit here.
+# Time and schedule are shared retained topics; feed is a broadcast; and pause,
+# the one command with no broadcast topic, finds its units in the device
+# registry by the `model` that MQTT discovery published. See the `units`
+# variable in "Cat feeder: pause the schedule when away".
+# ---------------------------------------------------------------------------
+
+# Whether the automatic schedule should run at all. Drag the blocks in the UI
+# rather than editing automations: a bank holiday is then one gesture, not a
+# code change.
+#
+# Defaults to every day, all day, so the feeders run normally until you say
+# otherwise.
+schedule:
+  cat_feeder_active:
+    name: Cat feeder active
+    icon: mdi:cat
+    monday: &all_day
+      - from: "00:00:00"
+        to: "24:00:00"
+    tuesday: *all_day
+    wednesday: *all_day
+    thursday: *all_day
+    friday: *all_day
+    saturday: *all_day
+    sunday: *all_day
+
+script:
+  cat_feeder_feed_all:
+    alias: "Cat feeder: feed every unit now"
+    description: >-
+      Publishes one broadcast so all three feeders turn at the same instant,
+      which is the requirement this whole project exists for. Feeding each unit
+      in turn would stagger them by the round trip.
+    mode: single
+    fields:
+      portions:
+        name: Portions
+        description: Portions per feeder.
+        default: 1
+        selector:
+          number:
+            min: 1
+            max: 10
+    sequence:
+      # Deliberately NOT retained. A retained feed command is replayed on every
+      # reconnect, and because manual feeds accumulate, a boot loop would empty
+      # the hopper.
+      - action: mqtt.publish
+        data:
+          topic: feeder/all/feed
+          retain: false
+          payload: "{{ portions | int(1) }}"
+
+automation:
+  - id: cat_feeder_publish_time
+    alias: "Cat feeder: publish the time"
+    description: >-
+      The only thing that tells the feeders what time it is. Every minute,
+      retained, so a feeder that reboots is told again within a minute.
+
+      Also answers feeder/time/request. A feeder only arms its schedule on a
+      *live* time, so one that connects just after a tick would otherwise sit
+      idle for up to a full minute; it asks once per MQTT connection and this
+      replies at once. The answer is an ordinary publish, so it still proves
+      Home Assistant is running now, which is the whole point of the live
+      versus retained rule.
+
+      That trigger belongs here rather than in a second automation: two
+      automations publishing the same topic is how they drift apart. mode:
+      single is fine — three feeders rebooting together send three requests
+      within milliseconds and two are dropped, but the one publish that happens
+      is forwarded live to all three subscribers.
+
+      Must be now(), never utcnow(). The firmware reads the wall-clock fields
+      and does not apply the offset, because slots are local times and the
+      feeders share a house with the broker. Publishing UTC would still look
+      valid while moving every meal by the offset. The feeder logs the offset
+      it received at startup, which is the only place that mistake shows up.
+    mode: single
+    triggers:
+      - trigger: time_pattern
+        minutes: "/1"
+      - trigger: homeassistant
+        event: start
+      # Published by a feeder as the last step of connecting, carrying its id.
+      # Never retained, so this cannot be replayed at Home Assistant's own
+      # restart.
+      - trigger: mqtt
+        topic: feeder/time/request
+    actions:
+      - action: mqtt.publish
+        data:
+          topic: feeder/time
+          retain: true
+          payload: "{{ now().isoformat() }}"
+
+  - id: cat_feeder_publish_schedule
+    alias: "Cat feeder: publish the schedule"
+    description: >-
+      Retained, so a rebooting feeder gets its meals back from the broker
+      rather than from flash. Republished on restart because it costs nothing
+      and covers a broker that was wiped.
+
+      Edit `meals` below to change feeding times, then reload automations. Up
+      to 8 slots; a longer list is rejected by the firmware whole rather than
+      truncated, and the unit keeps running the schedule it already had.
+
+      Editing YAML is the wrong answer for anyone who did not build this, and
+      there are two better ones, both written up in CLAUDE.md under "A second
+      version: the unit owns its clock and its schedule": near term, eight
+      input_datetime/input_number helpers defined by this package, with `meals`
+      templated from them so the times are set in the interface; properly, the
+      unit publishing its own slot entities over discovery, which needs no
+      package at all. Neither is built.
+    mode: single
+    variables:
+      meals: >-
+        [{"time":"08:00","portions":2},
+         {"time":"19:00","portions":2}]
+    triggers:
+      - trigger: homeassistant
+        event: start
+      - trigger: event
+        event_type: cat_feeder_republish_schedule
+    actions:
+      - action: mqtt.publish
+        data:
+          topic: feeder/schedule
+          retain: true
+          payload: "{{ meals | from_json | to_json }}"
+
+  - id: cat_feeder_pause_when_away
+    alias: "Cat feeder: pause the schedule when away"
+    description: >-
+      Pause stops the schedule, not the feeder: a manual feed still works while
+      paused, so a bowl can always be topped up by hand.
+
+      One publish per unit. There is deliberately no feeder/all/paused, because
+      two retained topics setting the same flag would race on reconnect with no
+      defined winner.
+
+      This publishes to the topic rather than calling switch.turn_on on the
+      discovered switch, and that is load-bearing: entity service calls skip
+      entities that are unavailable, and a feeder that is offline is exactly the
+      one whose pause has to be waiting in the broker when it comes back.
+    mode: single
+    variables:
+      # Every feeder Home Assistant has been told about, found rather than
+      # listed. MQTT discovery gives each unit a device whose `model` is this
+      # firmware's and whose `identifiers` are ["mqtt", "feeder_<id>"] -- both
+      # from publish_discovery() in src/mqtt.rs, and neither of them changed by
+      # renaming the device in the UI. So a unit added to the broker joins this
+      # automation by itself, and no device id is written down anywhere here.
+      #
+      # `model` is a contract with the firmware: change it in mqtt.rs and this
+      # silently stops matching anything.
+      units: >-
+        {%- set ns = namespace(ids=[]) -%}
+        {%- for e in integration_entities('mqtt')
+                     | select('is_device_attr', 'model', 'cat-feeder ESP32-C6') -%}
+          {%- set ns.ids = ns.ids +
+              [(device_attr(e, 'identifiers') | list | first)[1]
+               | replace('feeder_', '')] -%}
+        {%- endfor -%}
+        {{ ns.ids | unique | list }}
+    triggers:
+      - trigger: state
+        entity_id: schedule.cat_feeder_active
+      - trigger: homeassistant
+        event: start
+    actions:
+      - repeat:
+          for_each: "{{ units }}"
+          sequence:
+            - action: mqtt.publish
+              data:
+                topic: "feeder/{{ repeat.item }}/paused"
+                # Retained: there is no flash, so a unit that reboots while
+                # paused must come back paused from the broker alone.
+                retain: true
+                # Pauses only when the helper is explicitly off. If it is
+                # unknown or unavailable the feeders keep running, because the
+                # failure that matters is cats not being fed.
+                payload: >-
+                  {{ 'ON' if is_state('schedule.cat_feeder_active', 'off') else 'OFF' }}
