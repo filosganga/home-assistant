@@ -11,6 +11,8 @@ ha/config/*.db-wal
 ha/config/*.log
 ha/config/*.log.*
 ha/config/*.pid
+ha/config/.ha_run.lock
+ha/config/.cache/
 ha/config/.cloud/
 ha/config/.HA_VERSION
 ha/config/backups/
